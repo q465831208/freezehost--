@@ -1,8 +1,7 @@
 name: 🎮 FreezeHost 自动续期
 on:
   schedule:
-    # 修复：改为每天 UTC 时间 06:30（北京时间 14:30）执行
-    - cron: '30 6 * * *'
+    - cron: '30 6 */10 * *'
   workflow_dispatch:
 jobs:
   renew:
