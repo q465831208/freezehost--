@@ -7,7 +7,6 @@ on:
 
 jobs:
   renew:
-    name: 🔄 执行续期
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -24,79 +23,90 @@ jobs:
       - name: 🟢 安装 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-
-      - name: 📋 显示版本
-        run: |
-          node -v
-          npm -v
+          node-version: 22
 
       - name: 📦 安装依赖
         run: npm install
 
-      - name: 🌐 安装 Playwright 浏览器
+      - name: 🌐 安装 Playwright
         run: npx playwright install chromium --with-deps
 
       - name: ✅ 检查 Secrets
         run: |
           test -n "$DISCORD_ACCOUNT" || (echo "❌ 缺少 DISCORD_ACCOUNT" && exit 1)
-          test -n "$TG_BOT" || (echo "❌ 缺少 TG_BOT" && exit 1)
-          echo "✅ Secrets 检查通过"
+          echo "✅ 基础 Secrets OK"
 
-      - name: 🛡️ 启动 GOST 代理转发
+      # ===============================
+      # 🛡️ GOST 自动代理（核心）
+      # ===============================
+      - name: 🛡️ 启动 GOST 代理（自动适配）
         if: ${{ env.GOST_PROXY_SECRET != '' }}
         shell: bash
         run: |
           set -e
 
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-          echo "📦 GOST 版本: $VERSION"
+          echo "📦 获取 GOST 版本..."
+          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v' || echo "2.12.0")
+          echo "👉 使用版本: $VERSION"
 
-          wget -q -O gost.gz "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost-linux-amd64-${VERSION}.gz"
+          echo "📥 下载 GOST..."
+          URL="https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost-linux-amd64-${VERSION}.gz"
+          PROXY_URL="https://ghproxy.com/${URL}"
+
+          curl -L --fail -o gost.gz "$URL" || \
+          curl -L --fail -o gost.gz "$PROXY_URL"
+
           gunzip -f gost.gz
           chmod +x gost
           sudo mv gost /usr/local/bin/gost
 
+          echo "🚀 启动 GOST..."
+          echo "代理: $GOST_PROXY_SECRET"
+
           nohup gost -L=:8080 -F="$GOST_PROXY_SECRET" > gost.log 2>&1 &
-          sleep 3
+          sleep 5
 
-          echo "✅ GOST 已启动，测试连通性..."
-          curl --socks5-hostname 127.0.0.1:8080 -s https://api.ipify.org | sed 's/\.[0-9]*$/.**/' && echo
+          echo "📜 GOST 日志："
+          cat gost.log || true
 
-      - name: 🚀 运行续期脚本
+          echo "🌐 测试代理..."
+
+          echo "👉 SOCKS5 测试:"
+          curl --socks5-hostname 127.0.0.1:8080 -s --max-time 10 https://api.ipify.org && echo || echo "❌ SOCKS5失败"
+
+          echo "👉 HTTP 测试:"
+          curl -x http://127.0.0.1:8080 -s --max-time 10 https://api.ipify.org && echo || echo "❌ HTTP失败"
+
+      # ===============================
+      # 🚀 运行脚本
+      # ===============================
+      - name: 🚀 执行续期脚本
         env:
-          GOST_PROXY: http://127.0.0.1:8080
-        run: npx playwright test
+          HTTP_PROXY: http://127.0.0.1:8080
+          HTTPS_PROXY: http://127.0.0.1:8080
+        run: |
+          echo "🌍 当前出口IP:"
+          curl -s https://api.ipify.org || true
+          echo
 
-      - name: 📊 上传 Playwright 报告
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report
-          path: playwright-report/
-          if-no-files-found: ignore
-          retention-days: 7
+          npx playwright test
 
-      - name: 🧾 上传调试文件
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: freezehost-artifacts
-          path: artifacts/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: 📸 上传测试结果
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: test-results/
-          if-no-files-found: ignore
-          retention-days: 7
-
+      # ===============================
+      # 📊 调试输出
+      # ===============================
       - name: 📜 失败时输出 GOST 日志
         if: failure()
         run: |
           echo "===== gost.log ====="
           cat gost.log || true
+
+      - name: 📦 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            playwright-report/
+            test-results/
+            gost.log
+          if-no-files-found: ignore
