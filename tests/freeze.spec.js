@@ -60,7 +60,11 @@ function sendTG(result) {
       `📊 结果: ${result}`,
     ].join('\n');
 
-    const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: msg });
+    const body = JSON.stringify({
+      chat_id: TG_CHAT_ID,
+      text: msg,
+    });
+
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${TG_TOKEN}/sendMessage`,
@@ -189,6 +193,41 @@ async function handleOAuthPage(page) {
   console.log(`  ⚠️ handleOAuthPage 结束，URL: ${page.url()}`);
 }
 
+async function readRenewalStatusWithRetry(page) {
+  console.log('⏳ 等待续期状态加载...');
+
+  let renewalStatusText = null;
+
+  // 最多等 8 秒，让 LOADING 变真实内容
+  for (let i = 0; i < 8; i++) {
+    try {
+      const text = await page.locator('#renewal-status-console').innerText();
+      console.log(`   第 ${i + 1} 次读取: ${text}`);
+
+      if (text && !text.toLowerCase().includes('loading')) {
+        renewalStatusText = text.trim();
+        break;
+      }
+    } catch (e) {
+      console.log(`   ⚠️ 读取失败: ${e.message}`);
+    }
+
+    await page.waitForTimeout(1000);
+  }
+
+  // 8秒后还是拿不到，最后再强制读一次
+  if (!renewalStatusText) {
+    try {
+      renewalStatusText = (await page.locator('#renewal-status-console').innerText()).trim();
+    } catch {
+      renewalStatusText = null;
+    }
+  }
+
+  console.log(`📋 续期状态：${renewalStatusText || '获取失败'}`);
+  return renewalStatusText;
+}
+
 async function openRenewalModal(page) {
   console.log('🔍 查找新版续期入口...');
   const renewTrigger = page.locator('#renew-link-trigger');
@@ -253,7 +292,6 @@ async function clickActualRenewButton(page) {
     }
   }
 
-  // 兜底：扫描所有按钮/链接
   const genericCandidates = page.locator('button, a');
   const total = await genericCandidates.count();
 
@@ -291,7 +329,8 @@ test('FreezeHost 自动续期', async () => {
 
   ensureDir(ART_DIR);
 
-  let proxyConfig;
+  let proxyConfig = undefined;
+
   if (process.env.GOST_PROXY) {
     try {
       await new Promise((resolve, reject) => {
@@ -306,6 +345,7 @@ test('FreezeHost 自动续期', async () => {
         });
         req.end();
       });
+
       proxyConfig = { server: process.env.GOST_PROXY };
       console.log('🛡️ 本地代理连通，使用 GOST 转发');
     } catch {
@@ -326,10 +366,12 @@ test('FreezeHost 自动续期', async () => {
   console.log('🚀 浏览器就绪！');
 
   try {
-    // 出口 IP
+    // 出口 IP 验证
     console.log('🌐 验证出口 IP...');
     try {
-      const res = await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded' });
+      const res = await page.goto('https://api.ipify.org?format=json', {
+        waitUntil: 'domcontentloaded',
+      });
       const body = await res.text();
       const ip = JSON.parse(body).ip || body;
       const masked = ip.replace(/(\d+\.\d+\.\d+\.)\d+/, '$1xx');
@@ -367,12 +409,13 @@ test('FreezeHost 自动续期', async () => {
       try {
         err = await page.locator('[class*="errorMessage"]').first().innerText();
       } catch {}
+
       await saveDebugArtifacts(page, 'discord_login_failed');
       await sendTG(`❌ Discord 登录失败：${err}`);
       throw new Error(`❌ Discord 登录失败: ${err}`);
     }
 
-    // OAuth
+    // OAuth 授权
     console.log('⏳ 等待 OAuth 授权...');
     try {
       await page.waitForURL(/discord\.com\/oauth2\/authorize/, { timeout: 6000 });
@@ -432,11 +475,9 @@ test('FreezeHost 自动续期', async () => {
     await page.waitForTimeout(3000);
     await closeReviewPopupIfPresent(page);
 
-    // 读取续期状态
+    // 读取续期状态（带 8 秒重试）
     console.log('🔍 读取续期状态...');
-    const renewalStatusText = await page.locator('#renewal-status-console').innerText().catch(() => null);
-
-    console.log(`📋 续期状态：${renewalStatusText}`);
+    const renewalStatusText = await readRenewalStatusWithRetry(page);
 
     const remainingDays = parseRemainingDays(renewalStatusText);
 
@@ -482,30 +523,39 @@ test('FreezeHost 自动续期', async () => {
     console.log('📤 已提交续期操作，等待结果...');
     await page.waitForTimeout(3000);
 
-    // 优先看 URL 结果
     const finalUrl = page.url();
     const pageText = (await page.locator('body').innerText().catch(() => '')).toLowerCase();
 
-    if (finalUrl.includes('success=RENEWED') || pageText.includes('success') || pageText.includes('renewed')) {
+    if (
+      finalUrl.includes('success=RENEWED') ||
+      pageText.includes('success') ||
+      pageText.includes('renewed')
+    ) {
       console.log('🎉 续期成功！');
       await sendTG('✅ 续期成功！');
       expect(true).toBeTruthy();
       return;
     }
 
-    if (finalUrl.includes('err=CANNOTAFFORDRENEWAL') || pageText.includes('cannot afford')) {
+    if (
+      finalUrl.includes('err=CANNOTAFFORDRENEWAL') ||
+      pageText.includes('cannot afford')
+    ) {
       console.log('⚠️ 余额不足，无法续期');
       await sendTG('⚠️ 余额不足，请前往挂机页面赚取金币');
       return;
     }
 
-    if (finalUrl.includes('err=TOOEARLY') || pageText.includes('not renewable yet')) {
+    if (
+      finalUrl.includes('err=TOOEARLY') ||
+      pageText.includes('not renewable yet')
+    ) {
       console.log('⏰ 尚未到续期时间，无需操作');
       await sendTG('⏰ 尚未到续期时间，今日已续期或暂不需要续期');
       return;
     }
 
-    // 再次回读状态，兜底判断
+    // 再读一次状态做兜底
     try {
       const refreshedStatus = await page.locator('#renewal-status-console').innerText({ timeout: 5000 });
       console.log(`📋 续期后状态：${refreshedStatus || '[空]'}`);
