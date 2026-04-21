@@ -41,26 +41,34 @@ jobs:
           test -n "$DISCORD_ACCOUNT" || (echo "❌ 缺少 DISCORD_ACCOUNT" && exit 1)
           echo "✅ 基础 Secrets OK"
 
-      - name: 🛡️ 启动 GOST 代理（自动修复版）
+      - name: 🛡️ 启动 GOST 代理（最终修复版）
         if: ${{ env.GOST_PROXY_SECRET != '' }}
         shell: bash
         run: |
           set -euo pipefail
 
           echo "📦 获取 GOST 最新版本信息..."
-          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/ginuerzh/gost/releases/latest)
 
-          VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -n1 | cut -d'"' -f4 | tr -d 'v')
-          echo "👉 GOST 版本: ${VERSION:-unknown}"
+          RELEASE_JSON=$(curl -sSL --retry 3 --connect-timeout 10 https://api.github.com/repos/ginuerzh/gost/releases/latest || true)
 
-          ASSET_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | grep 'linux-amd64' | grep 'tar.gz' | head -n1 | cut -d'"' -f4)
+          if [ -z "${RELEASE_JSON:-}" ]; then
+            echo "⚠️ GitHub API 获取失败，使用默认版本"
+            VERSION="2.12.0"
+            ASSET_URL="https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost-linux-amd64-${VERSION}.tar.gz"
+          else
+            VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -n1 | cut -d'"' -f4 | tr -d 'v' || true)
+            echo "👉 GOST 版本: ${VERSION:-unknown}"
 
-          if [ -z "${ASSET_URL:-}" ]; then
-            echo "❌ 未找到 linux-amd64 的 tar.gz 下载链接"
-            exit 1
+            ASSET_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | grep 'linux-amd64' | grep 'tar.gz' | head -n1 | cut -d'"' -f4 || true)
+
+            if [ -z "${ASSET_URL:-}" ]; then
+              echo "⚠️ 未解析到下载地址，使用默认版本"
+              VERSION="2.12.0"
+              ASSET_URL="https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost-linux-amd64-${VERSION}.tar.gz"
+            fi
           fi
 
-          echo "📥 官方下载地址: $ASSET_URL"
+          echo "📥 下载地址: $ASSET_URL"
 
           if ! curl -L --fail --retry 3 --connect-timeout 15 -o gost.tar.gz "$ASSET_URL"; then
             echo "⚠️ 官方下载失败，尝试 ghproxy..."
