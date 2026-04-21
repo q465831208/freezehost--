@@ -25,6 +25,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: 📋 显示版本
+        run: |
+          node -v
+          npm -v
+
       - name: 📦 安装依赖
         run: npm install
 
@@ -36,64 +41,110 @@ jobs:
           test -n "$DISCORD_ACCOUNT" || (echo "❌ 缺少 DISCORD_ACCOUNT" && exit 1)
           echo "✅ 基础 Secrets OK"
 
-      # ===============================
-      # 🛡️ GOST 自动代理（核心）
-      # ===============================
-      - name: 🛡️ 启动 GOST 代理（自动适配）
+      - name: 🛡️ 启动 GOST 代理（自动修复版）
         if: ${{ env.GOST_PROXY_SECRET != '' }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "📦 获取 GOST 版本..."
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v' || echo "2.12.0")
-          echo "👉 使用版本: $VERSION"
+          echo "📦 获取 GOST 最新版本信息..."
+          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/ginuerzh/gost/releases/latest)
 
-          echo "📥 下载 GOST..."
-          URL="https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost-linux-amd64-${VERSION}.gz"
-          PROXY_URL="https://ghproxy.com/${URL}"
+          VERSION=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -n1 | cut -d'"' -f4 | tr -d 'v')
+          echo "👉 GOST 版本: ${VERSION:-unknown}"
 
-          curl -L --fail -o gost.gz "$URL" || \
-          curl -L --fail -o gost.gz "$PROXY_URL"
+          ASSET_URL=$(echo "$RELEASE_JSON" | grep '"browser_download_url"' | grep 'linux-amd64' | grep 'tar.gz' | head -n1 | cut -d'"' -f4)
 
-          gunzip -f gost.gz
-          chmod +x gost
-          sudo mv gost /usr/local/bin/gost
+          if [ -z "${ASSET_URL:-}" ]; then
+            echo "❌ 未找到 linux-amd64 的 tar.gz 下载链接"
+            exit 1
+          fi
+
+          echo "📥 官方下载地址: $ASSET_URL"
+
+          if ! curl -L --fail --retry 3 --connect-timeout 15 -o gost.tar.gz "$ASSET_URL"; then
+            echo "⚠️ 官方下载失败，尝试 ghproxy..."
+            curl -L --fail --retry 3 --connect-timeout 15 -o gost.tar.gz "https://ghproxy.com/${ASSET_URL}"
+          fi
+
+          echo "🔎 检查下载文件类型..."
+          file gost.tar.gz || true
+
+          if ! tar -tzf gost.tar.gz >/dev/null 2>&1; then
+            echo "❌ 下载文件不是有效的 tar.gz"
+            echo "===== 文件前200字节 ====="
+            head -c 200 gost.tar.gz || true
+            exit 1
+          fi
+
+          echo "📦 解压 GOST..."
+          rm -rf gost_extract
+          mkdir -p gost_extract
+          tar -xzf gost.tar.gz -C gost_extract
+
+          GOST_BIN=$(find gost_extract -type f -name gost | head -n1)
+
+          if [ -z "${GOST_BIN:-}" ]; then
+            echo "❌ 解压后未找到 gost 可执行文件"
+            find gost_extract -maxdepth 3 -type f | sed 's/^/ - /'
+            exit 1
+          fi
+
+          chmod +x "$GOST_BIN"
+          sudo mv "$GOST_BIN" /usr/local/bin/gost
+
+          echo "✅ GOST 安装完成: $(command -v gost)"
+          gost -V || true
 
           echo "🚀 启动 GOST..."
-          echo "代理: $GOST_PROXY_SECRET"
-
-          nohup gost -L=:8080 -F="$GOST_PROXY_SECRET" > gost.log 2>&1 &
+          nohup /usr/local/bin/gost -L=:8080 -F="$GOST_PROXY_SECRET" > gost.log 2>&1 &
           sleep 5
 
           echo "📜 GOST 日志："
           cat gost.log || true
 
-          echo "🌐 测试代理..."
+          echo "🌐 测试代理连通性..."
 
           echo "👉 SOCKS5 测试:"
-          curl --socks5-hostname 127.0.0.1:8080 -s --max-time 10 https://api.ipify.org && echo || echo "❌ SOCKS5失败"
+          if curl --socks5-hostname 127.0.0.1:8080 -s --max-time 10 https://api.ipify.org; then
+            echo
+            echo "✅ SOCKS5 可用"
+          else
+            echo "❌ SOCKS5 失败"
+          fi
 
           echo "👉 HTTP 测试:"
-          curl -x http://127.0.0.1:8080 -s --max-time 10 https://api.ipify.org && echo || echo "❌ HTTP失败"
+          if curl -x http://127.0.0.1:8080 -s --max-time 10 https://api.ipify.org; then
+            echo
+            echo "✅ HTTP 可用"
+          else
+            echo "❌ HTTP 失败"
+          fi
 
-      # ===============================
-      # 🚀 运行脚本
-      # ===============================
-      - name: 🚀 执行续期脚本
+      - name: 🌍 显示当前出口 IP（直连）
+        run: |
+          echo "直连出口 IP:"
+          curl -s --max-time 10 https://api.ipify.org || true
+          echo
+
+      - name: 🚀 执行续期脚本（带代理）
+        if: ${{ env.GOST_PROXY_SECRET != '' }}
         env:
+          GOST_PROXY: http://127.0.0.1:8080
           HTTP_PROXY: http://127.0.0.1:8080
           HTTPS_PROXY: http://127.0.0.1:8080
         run: |
-          echo "🌍 当前出口IP:"
-          curl -s https://api.ipify.org || true
+          echo "代理出口 IP:"
+          curl -x http://127.0.0.1:8080 -s --max-time 10 https://api.ipify.org || true
           echo
 
           npx playwright test
 
-      # ===============================
-      # 📊 调试输出
-      # ===============================
+      - name: 🚀 执行续期脚本（直连）
+        if: ${{ env.GOST_PROXY_SECRET == '' }}
+        run: |
+          npx playwright test
+
       - name: 📜 失败时输出 GOST 日志
         if: failure()
         run: |
@@ -108,5 +159,6 @@ jobs:
           path: |
             playwright-report/
             test-results/
+            artifacts/
             gost.log
           if-no-files-found: ignore
