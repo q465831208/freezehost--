@@ -1,0 +1,480 @@
+// tests/freeze.spec.js
+const { test, expect, chromium } = require('@playwright/test');
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const [DISCORD_EMAIL, DISCORD_PASSWORD] = (process.env.DISCORD_ACCOUNT || ',').split(',');
+const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
+
+const TIMEOUT = 60000;
+const ART_DIR = path.resolve(process.cwd(), 'artifacts');
+
+function nowStr() {
+  return new Date().toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).replace(/\//g, '-');
+}
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+async function saveDebugArtifacts(page, prefix) {
+  try {
+    ensureDir(ART_DIR);
+    const ts = Date.now();
+    const png = path.join(ART_DIR, `${prefix}_${ts}.png`);
+    const html = path.join(ART_DIR, `${prefix}_${ts}.html`);
+
+    await page.screenshot({ path: png, fullPage: true });
+    fs.writeFileSync(html, await page.content(), 'utf8');
+
+    console.log(`🧾 已保存调试文件:`);
+    console.log(`   - ${png}`);
+    console.log(`   - ${html}`);
+  } catch (e) {
+    console.log(`⚠️ 保存调试文件失败: ${e.message}`);
+  }
+}
+
+function sendTG(result) {
+  return new Promise((resolve) => {
+    if (!TG_CHAT_ID || !TG_TOKEN) {
+      console.log('⚠️ TG_BOT 未配置，跳过推送');
+      return resolve();
+    }
+
+    const msg = [
+      '🎮 FreezeHost 续期通知',
+      `🕐 运行时间: ${nowStr()}`,
+      '🖥 服务器: FreezeHost Free',
+      `📊 结果: ${result}`,
+    ].join('\n');
+
+    const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: msg });
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TG_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, (res) => {
+      if (res.statusCode === 200) {
+        console.log('📨 TG 推送成功');
+      } else {
+        console.log(`⚠️ TG 推送失败：HTTP ${res.statusCode}`);
+      }
+      resolve();
+    });
+
+    req.on('error', (e) => {
+      console.log(`⚠️ TG 推送异常：${e.message}`);
+      resolve();
+    });
+
+    req.setTimeout(15000, () => {
+      console.log('⚠️ TG 推送超时');
+      req.destroy();
+      resolve();
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+function parseRemainingDays(text) {
+  if (!text) return null;
+
+  const normalized = text.replace(/\s+/g, ' ').trim();
+
+  const dayMatch = normalized.match(/(\d+(?:\.\d+)?)\s*days?/i);
+  const hourMatch = normalized.match(/(\d+(?:\.\d+)?)\s*hours?/i);
+
+  if (!dayMatch && !hourMatch) return null;
+
+  const days = dayMatch ? parseFloat(dayMatch[1]) : 0;
+  const hours = hourMatch ? parseFloat(hourMatch[1]) : 0;
+
+  return days + hours / 24;
+}
+
+async function closeReviewPopupIfPresent(page) {
+  try {
+    const overlay = page.locator('#review-popup-overlay');
+    if (await overlay.count()) {
+      const visible = await overlay.isVisible().catch(() => false);
+      if (visible) {
+        console.log('🪟 检测到评分弹窗，尝试关闭...');
+        const closeBtn = page.locator('#review-popup-overlay button').first();
+        await closeBtn.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        console.log('✅ 评分弹窗已处理');
+      }
+    }
+  } catch {
+    // 忽略
+  }
+}
+
+async function handleOAuthPage(page) {
+  console.log(`  📄 当前 URL: ${page.url()}`);
+  await page.waitForTimeout(3000);
+
+  const selectors = [
+    'button:has-text("Authorize")',
+    'button:has-text("授权")',
+    'button[type="submit"]',
+    'div[class*="footer"] button',
+    'button[class*="primary"]',
+  ];
+
+  for (let i = 0; i < 8; i++) {
+    console.log(`  🔄 第 ${i + 1} 次尝试，URL: ${page.url()}`);
+
+    if (!page.url().includes('discord.com')) {
+      console.log('  ✅ 已离开 Discord');
+      return;
+    }
+
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(500);
+
+    for (const selector of selectors) {
+      try {
+        const btn = page.locator(selector).last();
+        const visible = await btn.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        const text = ((await btn.innerText().catch(() => '')) || '').trim();
+        console.log(`  🔘 找到按钮: "${text}" (${selector})`);
+
+        if (
+          text.includes('取消') ||
+          text.toLowerCase().includes('cancel') ||
+          text.toLowerCase().includes('deny')
+        ) {
+          continue;
+        }
+
+        const disabled = await btn.isDisabled().catch(() => false);
+        if (disabled) {
+          console.log('  ⏳ 按钮 disabled，等待...');
+          break;
+        }
+
+        await btn.click({ timeout: 5000 });
+        console.log(`  ✅ 已点击: "${text}"`);
+        await page.waitForTimeout(2000);
+
+        if (!page.url().includes('discord.com')) {
+          console.log('  ✅ 授权成功，已跳转');
+          return;
+        }
+        break;
+      } catch {
+        continue;
+      }
+    }
+
+    await page.waitForTimeout(2000);
+  }
+}
+
+async function waitForDashboard(page) {
+  try {
+    await page.waitForURL(
+      url => url.includes('/callback') || url.includes('/dashboard'),
+      { timeout: 15000 }
+    );
+  } catch {}
+
+  if (page.url().includes('/callback')) {
+    await page.waitForURL(/free\.freezehost\.pro\/dashboard/, { timeout: 20000 });
+  }
+
+  if (!/free\.freezehost\.pro/.test(page.url())) {
+    throw new Error(`❌ 登录后未进入 FreezeHost，当前 URL: ${page.url()}`);
+  }
+}
+
+async function findServerConsoleUrl(page) {
+  await page.waitForTimeout(3000);
+
+  const href = await page.evaluate(() => {
+    const link = document.querySelector('a[href*="server-console"]');
+    return link ? link.href : null;
+  });
+
+  return href;
+}
+
+async function readRenewalStatusText(page) {
+  const locator = page.locator('#renewal-status-console');
+
+  await expect(locator).toBeVisible({ timeout: 15000 });
+  const text = await locator.innerText();
+
+  return text?.trim() || null;
+}
+
+async function openRenewalModal(page) {
+  console.log('🔍 查找新版续期入口...');
+
+  const renewTriggerCandidates = [
+    page.locator('#renew-link-trigger'),
+    page.getByRole('button', { name: /renew/i }),
+    page.locator('text=/renewable/i').first(),
+  ];
+
+  let clicked = false;
+
+  for (const locator of renewTriggerCandidates) {
+    try {
+      const el = locator.first();
+      const visible = await el.isVisible({ timeout: 2000 }).catch(() => false);
+      if (!visible) continue;
+
+      await el.click({ timeout: 5000 });
+      clicked = true;
+      console.log('✅ 已点击 Renew 按钮');
+      break;
+    } catch {}
+  }
+
+  if (!clicked) {
+    throw new Error('❌ 未找到续期入口按钮');
+  }
+
+  await closeReviewPopupIfPresent(page);
+
+  const renewModal = page.locator('#renew-modal');
+  await expect(renewModal).toBeVisible({ timeout: 10000 });
+  console.log('✅ 已检测到 Renew Server 确认弹窗');
+}
+
+async function renewalModalSaysNotRenewable(page) {
+  const renewModal = page.locator('#renew-modal');
+
+  if (!(await renewModal.isVisible().catch(() => false))) {
+    return false;
+  }
+
+  const text = ((await renewModal.innerText().catch(() => '')) || '').toLowerCase();
+  return text.includes('not renewable yet') || text.includes('too early');
+}
+
+async function clickActualRenewButton(page) {
+  const candidateLocators = [
+    page.locator('form[action*="/api/renew"] button[type="submit"]'),
+    page.locator('#renew-modal button:has-text("Confirm")'),
+    page.locator('#renew-modal button:has-text("Renew")'),
+    page.getByRole('button', { name: /confirm/i }),
+    page.getByRole('button', { name: /^renew$/i }),
+  ];
+
+  for (const locator of candidateLocators) {
+    try {
+      const count = await locator.count();
+      for (let i = 0; i < count; i++) {
+        const el = locator.nth(i);
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+
+        const text = ((await el.innerText().catch(() => '')) || '').trim();
+        console.log(`👉 尝试点击续期确认控件: "${text || '[表单提交按钮]'}"`);
+
+        await Promise.allSettled([
+          page.waitForURL(/success=RENEWED|err=/i, { timeout: 10000 }),
+          page.waitForLoadState('domcontentloaded', { timeout: 10000 }),
+          el.click({ timeout: 5000 }),
+        ]);
+
+        return true;
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
+async function assertRenewSuccess(page) {
+  await Promise.race([
+    page.waitForURL(/success=RENEWED/i, { timeout: 20000 }),
+    page.getByText(/Server Renewed Successfully/i).waitFor({
+      state: 'visible',
+      timeout: 20000,
+    }),
+  ]);
+
+  await expect(
+    page.getByText(/Server Renewed Successfully/i)
+  ).toBeVisible({ timeout: 10000 });
+}
+
+test('FreezeHost 自动续期', async () => {
+  if (!DISCORD_EMAIL || !DISCORD_PASSWORD) {
+    throw new Error('❌ 缺少 DISCORD_ACCOUNT，格式: email,password');
+  }
+
+  ensureDir(ART_DIR);
+
+  let proxyConfig;
+  if (process.env.GOST_PROXY) {
+    try {
+      await new Promise((resolve, reject) => {
+        const req = http.request(
+          { host: '127.0.0.1', port: 8080, path: '/', method: 'GET', timeout: 3000 },
+          () => resolve()
+        );
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('timeout'));
+        });
+        req.end();
+      });
+      proxyConfig = { server: process.env.GOST_PROXY };
+      console.log('🛡️ 本地代理连通，使用 GOST 转发');
+    } catch {
+      console.log('⚠️ 本地代理不可达，降级为直连');
+    }
+  }
+
+  console.log('🔧 启动浏览器...');
+  const browser = await chromium.launch({
+    headless: true,
+    proxy: proxyConfig,
+  });
+
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  page.setDefaultTimeout(TIMEOUT);
+
+  try {
+    console.log('🔑 打开 FreezeHost 登录页...');
+    await page.goto('https://free.freezehost.pro', { waitUntil: 'domcontentloaded' });
+
+    console.log('📤 点击 Login with Discord...');
+    await page.getByText('Login with Discord', { exact: true }).click({ timeout: 10000 });
+
+    console.log('⏳ 等待服务条款弹窗...');
+    const confirmBtn = page.locator('button#confirm-login');
+    await expect(confirmBtn).toBeVisible({ timeout: 15000 });
+    await confirmBtn.click();
+    console.log('✅ 已接受服务条款');
+
+    console.log('⏳ 等待跳转 Discord 登录页...');
+    await page.waitForURL(/discord\.com\/login/, { timeout: 20000 });
+
+    console.log('✏️ 填写账号密码...');
+    await page.fill('input[name="email"]', DISCORD_EMAIL);
+    await page.fill('input[name="password"]', DISCORD_PASSWORD);
+
+    console.log('📤 提交登录请求...');
+    await page.click('button[type="submit"]');
+    await page.waitForTimeout(2000);
+
+    if (/discord\.com\/login/.test(page.url())) {
+      let err = '账密错误或触发了 2FA / 验证码';
+      try {
+        err = await page.locator('[class*="errorMessage"]').first().innerText();
+      } catch {}
+      throw new Error(`❌ Discord 登录失败: ${err}`);
+    }
+
+    console.log('⏳ 等待 OAuth 授权...');
+    try {
+      await page.waitForURL(/discord\.com\/oauth2\/authorize/, { timeout: 6000 });
+      console.log('🔍 进入 OAuth 授权页，处理中...');
+      await page.waitForTimeout(2000);
+
+      if (page.url().includes('discord.com')) {
+        await handleOAuthPage(page);
+      }
+
+      await page.waitForURL(/free\.freezehost\.pro/, { timeout: 20000 });
+    } catch {
+      // 有时不会停在 OAuth 页，直接略过
+    }
+
+    console.log('⏳ 确认到达 Dashboard...');
+    await waitForDashboard(page);
+    console.log(`✅ 登录成功！当前：${page.url()}`);
+
+    console.log('🔍 查找 Manage 按钮...');
+    const serverUrl = await findServerConsoleUrl(page);
+
+    if (!serverUrl) {
+      throw new Error('❌ 未找到 server-console 链接');
+    }
+
+    console.log(`✅ 找到链接：${serverUrl}`);
+    await page.goto(serverUrl, { waitUntil: 'domcontentloaded' });
+    console.log(`✅ 已跳转到 Server Console: ${page.url()}`);
+
+    await page.waitForTimeout(3000);
+    await closeReviewPopupIfPresent(page);
+
+    console.log('🔍 读取续期状态...');
+    const renewalStatusText = await readRenewalStatusText(page);
+    console.log(`📋 续期状态：${renewalStatusText}`);
+
+    const remainingDays = parseRemainingDays(renewalStatusText);
+    if (remainingDays == null) {
+      throw new Error(`❌ 无法解析续期状态文本：${renewalStatusText}`);
+    }
+
+    console.log(`⏳ 剩余天数：${remainingDays.toFixed(2)}`);
+
+    if (remainingDays > 7) {
+      const msg = `⏰ 剩余 ${remainingDays.toFixed(2)} 天，未到续期时间（需 ≤7 天才续期）`;
+      console.log(msg);
+      await sendTG(msg);
+      return;
+    }
+
+    console.log(`✅ 剩余 ${remainingDays.toFixed(2)} 天，需要续期，继续操作...`);
+
+    await openRenewalModal(page);
+
+    if (await renewalModalSaysNotRenewable(page)) {
+      const msg = '⏰ 当前提示未到续期时间';
+      console.log(msg);
+      await sendTG(msg);
+      return;
+    }
+
+    console.log('🔍 尝试点击确认按钮...');
+    const clicked = await clickActualRenewButton(page);
+
+    if (!clicked) {
+      throw new Error('⚠️ 已打开弹窗，但未找到 Confirm / Renew 续期确认按钮');
+    }
+
+    console.log('📤 已提交续期操作，等待结果...');
+    await assertRenewSuccess(page);
+
+    console.log(`🎉 续期成功！当前：${page.url()}`);
+    await sendTG('✅ 续期成功！');
+  } catch (e) {
+    await saveDebugArtifacts(page, 'freeze_exception');
+
+    const msg = String(e && e.message ? e.message : e);
+    if (!msg.includes('余额不足')) {
+      await sendTG(`❌ 脚本异常：${msg}`);
+    }
+
+    throw e;
+  } finally {
+    await browser.close();
+  }
+});
