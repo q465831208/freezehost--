@@ -49,6 +49,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: failure-screenshots
-          path: test-results/
+          name: failure-debug-files
+          path: |
+            test-results/
+            artifacts/
           retention-days: 7
