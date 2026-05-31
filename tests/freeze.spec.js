@@ -162,10 +162,13 @@ async function openRenewalModal(page) {
 
   const modalCandidates = [
     page.locator('#renew-modal'),
+    page.locator('#renew-link-modal'),
     page.locator('[id*="renew"][role="dialog"]'),
     page.locator('[role="dialog"]').filter({ hasText: /renew|confirm|not renewable|too early/i }),
     page.locator('div.fixed').filter({ hasText: /renew|confirm|not renewable|too early/i }),
     page.locator('form[action*="/api/renew"]'),
+    page.locator('a[href*="/renew?id="]'),
+    page.locator('a[href*="../renew?id="]'),
     page.getByRole('button', { name: /confirm/i }),
   ];
 
@@ -199,6 +202,10 @@ async function openRenewalModal(page) {
 
 async function clickActualRenewButton(page) {
   const candidateLocators = [
+    page.locator('#renew-link-modal'),
+    page.locator('#renew-modal a').filter({ hasText: /renew|confirm|yes/i }),
+    page.locator('a[href*="/renew?id="]').filter({ hasText: /renew|confirm|yes/i }),
+    page.locator('a[href*="../renew?id="]').filter({ hasText: /renew|confirm|yes/i }),
     page.locator('form[action*="/api/renew"] button[type="submit"]'),
     page.locator('form[action*="/api/renew"] input[type="submit"]'),
     page.locator('#renew-modal button').filter({ hasText: /confirm|renew|yes/i }),
