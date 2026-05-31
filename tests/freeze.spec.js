@@ -143,24 +143,67 @@ async function renewalModalSaysNotRenewable(page) {
 
 async function openRenewalModal(page) {
   console.log('🔍 查找新版续期入口...');
-  const renewTrigger = page.locator('#renew-link-trigger');
+  await closeReviewPopupIfPresent(page);
+
+  const renewTrigger = page.locator([
+    '#renew-link-trigger',
+    'a:has-text("Renew")',
+    'button:has-text("Renew")',
+    '[data-modal-target*="renew"]',
+    '[data-modal-toggle*="renew"]',
+  ].join(', ')).first();
 
   await expect(renewTrigger).toBeVisible({ timeout: 10000 });
+  await renewTrigger.scrollIntoViewIfNeeded().catch(() => {});
   await renewTrigger.click();
   console.log('✅ 已点击 Renew 按钮');
 
   await closeReviewPopupIfPresent(page);
 
-  const renewModal = page.locator('#renew-modal');
-  await expect(renewModal).toBeVisible({ timeout: 10000 });
-  console.log('✅ 已检测到 Renew Server 确认弹窗');
+  const modalCandidates = [
+    page.locator('#renew-modal'),
+    page.locator('[id*="renew"][role="dialog"]'),
+    page.locator('[role="dialog"]').filter({ hasText: /renew|confirm|not renewable|too early/i }),
+    page.locator('div.fixed').filter({ hasText: /renew|confirm|not renewable|too early/i }),
+    page.locator('form[action*="/api/renew"]'),
+    page.getByRole('button', { name: /confirm/i }),
+  ];
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (/success=RENEWED|err=/i.test(page.url())) {
+      console.log('✅ 点击 Renew 后页面已直接返回续期结果');
+      return;
+    }
+
+    for (const locator of modalCandidates) {
+      const count = await locator.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        if (await locator.nth(i).isVisible().catch(() => false)) {
+          console.log('✅ 已检测到 Renew Server 确认弹窗/确认控件');
+          return;
+        }
+      }
+    }
+
+    if (await renewalModalSaysNotRenewable(page).catch(() => false)) {
+      console.log('✅ 已检测到未到续期时间提示');
+      return;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw new Error('点击 Renew 后未找到确认弹窗或确认按钮，可能页面结构已变更');
 }
 
 async function clickActualRenewButton(page) {
   const candidateLocators = [
     page.locator('form[action*="/api/renew"] button[type="submit"]'),
-    page.locator('#renew-modal button:has-text("Confirm")'),
-    page.getByRole('button', { name: /confirm/i }),
+    page.locator('form[action*="/api/renew"] input[type="submit"]'),
+    page.locator('#renew-modal button').filter({ hasText: /confirm|renew|yes/i }),
+    page.locator('[role="dialog"] button').filter({ hasText: /confirm|renew|yes/i }),
+    page.getByRole('button', { name: /confirm|renew server|renew now|yes/i }),
   ];
 
   for (const locator of candidateLocators) {
@@ -183,6 +226,21 @@ async function clickActualRenewButton(page) {
       }
     } catch {}
   }
+
+  const renewForm = page.locator('form[action*="/api/renew"]').first();
+  if (await renewForm.isVisible().catch(() => false)) {
+    console.log('👉 未找到可点击按钮，尝试直接提交续期表单');
+    await Promise.allSettled([
+      page.waitForURL(/success=RENEWED|err=/i, { timeout: 10000 }),
+      page.waitForLoadState('domcontentloaded', { timeout: 10000 }),
+      renewForm.evaluate((form) => {
+        if (form.requestSubmit) form.requestSubmit();
+        else form.submit();
+      }),
+    ]);
+    return true;
+  }
+
   return false;
 }
 
