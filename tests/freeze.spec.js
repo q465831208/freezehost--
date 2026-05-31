@@ -44,19 +44,25 @@ async function saveDebugArtifacts(page, prefix) {
   }
 }
 
-function sendTG(result) {
+function sendTG(result, remainingDays = null) {
   return new Promise((resolve) => {
     if (!TG_CHAT_ID || !TG_TOKEN) {
       console.log('⚠️ TG_BOT 未配置，跳过推送');
       return resolve();
     }
 
-    const msg = [
+    const msgLines = [
       '🎮 FreezeHost 续期通知',
       `🕐 运行时间: ${nowStr()}`,
       '🖥 服务器: FreezeHost Free',
       `📊 结果: ${result}`,
-    ].join('\n');
+    ];
+
+    if (typeof remainingDays === 'number') {
+      msgLines.push(`⏳ 剩余时间: ${remainingDays.toFixed(2)} 天`);
+    }
+
+    const msg = msgLines.join('\n');
 
     const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: msg });
     const req = https.request({
@@ -343,7 +349,7 @@ test('FreezeHost 自动续期', async () => {
     if (remainingDays > 7) {
       const msg = `⏰ 剩余 ${remainingDays.toFixed(2)} 天，未到续期时间（需 ≤7 天才续期）`;
       console.log(msg);
-      await sendTG(msg);
+      await sendTG(msg, remainingDays);
       return;
     }
 
@@ -354,7 +360,7 @@ test('FreezeHost 自动续期', async () => {
     if (await renewalModalSaysNotRenewable(page)) {
       const msg = '⏰ 当前提示未到续期时间';
       console.log(msg);
-      await sendTG(msg);
+      await sendTG(msg, remainingDays);
       return;
     }
 
@@ -373,7 +379,11 @@ test('FreezeHost 自动续期', async () => {
       ]);
       await expect(page.getByText(/Server Renewed Successfully/i)).toBeVisible({ timeout: 10000 });
       console.log('🎉 续期成功！');
-      await sendTG('✅ 续期成功！');
+      const renewedStatusText = await page.locator('#renewal-status-console')
+        .innerText({ timeout: 5000 })
+        .catch(() => null);
+      const renewedRemainingDays = parseRemainingDays(renewedStatusText) ?? remainingDays;
+      await sendTG('✅ 续期成功！', renewedRemainingDays);
       return;
     } catch (e) {
       // 捕获超时异常，检查是不是因为余额不足
@@ -382,7 +392,7 @@ test('FreezeHost 自动续期', async () => {
 
       if (finalUrl.includes('err=CANNOTAFFORDRENEWAL') || pageText.includes('cannot afford')) {
         console.log('⚠️ 余额不足，无法续期');
-        await sendTG('⚠️ 余额不足，请前往挂机页面赚取金币');
+        await sendTG('⚠️ 余额不足，请前往挂机页面赚取金币', remainingDays);
         return;
       }
       throw e; // 如果不是余额不足，重新抛出原本的错误截取调试截图
