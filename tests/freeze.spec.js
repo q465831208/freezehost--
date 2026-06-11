@@ -93,6 +93,10 @@ function parseRemainingDays(text) {
   return days + hours / 24;
 }
 
+function normalizeText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
 async function closeReviewPopupIfPresent(page) {
   try {
     const overlay = page.locator('#review-popup-overlay');
@@ -230,7 +234,7 @@ async function clickActualRenewButton(page) {
         console.log(`👉 尝试点击续期确认控件: "${text || '[表单提交按钮]'}"`);
 
         await Promise.allSettled([
-          page.waitForURL(/success=RENEWED|err=/i, { timeout: 10000 }),
+          page.waitForURL(/success=RENEWED|err=/i, { timeout: 10000, waitUntil: 'commit' }),
           page.waitForLoadState('domcontentloaded', { timeout: 10000 }),
           el.click({ timeout: 5000 }),
         ]);
@@ -244,7 +248,7 @@ async function clickActualRenewButton(page) {
   if (await renewForm.isVisible().catch(() => false)) {
     console.log('👉 未找到可点击按钮，尝试直接提交续期表单');
     await Promise.allSettled([
-      page.waitForURL(/success=RENEWED|err=/i, { timeout: 10000 }),
+      page.waitForURL(/success=RENEWED|err=/i, { timeout: 10000, waitUntil: 'commit' }),
       page.waitForLoadState('domcontentloaded', { timeout: 10000 }),
       renewForm.evaluate((form) => {
         if (form.requestSubmit) form.requestSubmit();
@@ -255,6 +259,105 @@ async function clickActualRenewButton(page) {
   }
 
   return false;
+}
+
+async function waitForRenewResult(page, options = {}) {
+  const {
+    timeout = 20000,
+    previousStatusText = '',
+    previousRemainingDays = null,
+  } = options;
+
+  const successText = page.getByText(/Server Renewed Successfully|Renewed Successfully/i).first();
+  const insufficientText = page.getByText(/cannot afford|not enough coins|insufficient/i).first();
+  const normalizedPreviousStatusText = normalizeText(previousStatusText);
+
+  const signal = await Promise.any([
+    page.waitForURL(/success=RENEWED/i, { timeout, waitUntil: 'commit' }).then(() => 'success-url'),
+    successText.waitFor({ state: 'visible', timeout }).then(() => 'success-text'),
+    page.waitForURL(/err=CANNOTAFFORDRENEWAL/i, { timeout, waitUntil: 'commit' }).then(() => 'insufficient-url'),
+    insufficientText.waitFor({ state: 'visible', timeout }).then(() => 'insufficient-text'),
+    page.waitForFunction(
+      ({ selector, previousText }) => {
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        const currentText = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        return Boolean(currentText) && currentText !== previousText;
+      },
+      { selector: '#renewal-status-console', previousText: normalizedPreviousStatusText },
+      { timeout }
+    ).then(() => 'status-changed'),
+  ]).catch(() => 'timeout');
+
+  const finalUrl = page.url();
+  const pageText = (await page.locator('body').innerText().catch(() => '')).toLowerCase();
+  const currentStatusText = await page.locator('#renewal-status-console')
+    .innerText({ timeout: 2000 })
+    .catch(() => null);
+  const normalizedCurrentStatusText = normalizeText(currentStatusText);
+  const currentRemainingDays = parseRemainingDays(currentStatusText);
+  const statusLooksRenewed =
+    signal === 'status-changed' &&
+    typeof previousRemainingDays === 'number' &&
+    typeof currentRemainingDays === 'number' &&
+    currentRemainingDays > previousRemainingDays + 0.5;
+
+  if (
+    signal === 'success-url' ||
+    signal === 'success-text' ||
+    statusLooksRenewed ||
+    /success=RENEWED/i.test(finalUrl) ||
+    /server renewed successfully|renewed successfully/i.test(pageText)
+  ) {
+    return {
+      status: 'success',
+      signal,
+      finalUrl,
+      pageText,
+      currentStatusText,
+      currentRemainingDays,
+      debugSummary: `signal=${signal}, url=${finalUrl}, previousStatus="${normalizedPreviousStatusText}", currentStatus="${normalizedCurrentStatusText}"`,
+    };
+  }
+
+  if (
+    signal === 'insufficient-url' ||
+    signal === 'insufficient-text' ||
+    /err=CANNOTAFFORDRENEWAL/i.test(finalUrl) ||
+    /cannot afford|not enough coins|insufficient/i.test(pageText)
+  ) {
+    return {
+      status: 'insufficient',
+      signal,
+      finalUrl,
+      pageText,
+      currentStatusText,
+      currentRemainingDays,
+      debugSummary: `signal=${signal}, url=${finalUrl}, pageTextMatched=insufficient`,
+    };
+  }
+
+  if (/err=/i.test(finalUrl)) {
+    return {
+      status: 'error',
+      signal,
+      finalUrl,
+      pageText,
+      currentStatusText,
+      currentRemainingDays,
+      debugSummary: `signal=${signal}, url=${finalUrl}, currentStatus="${normalizedCurrentStatusText}"`,
+    };
+  }
+
+  return {
+    status: 'unknown',
+    signal,
+    finalUrl,
+    pageText,
+    currentStatusText,
+    currentRemainingDays,
+    debugSummary: `signal=${signal}, url=${finalUrl}, previousStatus="${normalizedPreviousStatusText}", currentStatus="${normalizedCurrentStatusText}"`,
+  };
 }
 
 // ============== 主流程 ==============
@@ -372,31 +475,30 @@ test('FreezeHost 自动续期', async () => {
 
     console.log('📤 已提交续期操作，等待结果...');
 
-    try {
-      await Promise.race([
-        page.waitForURL(/success=RENEWED/i, { timeout: 15000 }),
-        page.getByText(/Server Renewed Successfully/i).waitFor({ state: 'visible', timeout: 15000 }),
-      ]);
-      await expect(page.getByText(/Server Renewed Successfully/i)).toBeVisible({ timeout: 10000 });
+    const renewResult = await waitForRenewResult(page, {
+      previousStatusText: renewalStatusText,
+      previousRemainingDays: remainingDays,
+    });
+
+    console.log(`🧭 续期结果诊断: ${renewResult.debugSummary}`);
+
+    if (renewResult.status === 'success') {
       console.log('🎉 续期成功！');
-      const renewedStatusText = await page.locator('#renewal-status-console')
+      const renewedStatusText = renewResult.currentStatusText || await page.locator('#renewal-status-console')
         .innerText({ timeout: 5000 })
         .catch(() => null);
-      const renewedRemainingDays = parseRemainingDays(renewedStatusText) ?? remainingDays;
+      const renewedRemainingDays = parseRemainingDays(renewedStatusText) ?? renewResult.currentRemainingDays ?? remainingDays;
       await sendTG('✅ 续期成功！', renewedRemainingDays);
       return;
-    } catch (e) {
-      // 捕获超时异常，检查是不是因为余额不足
-      const finalUrl = page.url();
-      const pageText = (await page.locator('body').innerText().catch(() => '')).toLowerCase();
-
-      if (finalUrl.includes('err=CANNOTAFFORDRENEWAL') || pageText.includes('cannot afford')) {
-        console.log('⚠️ 余额不足，无法续期');
-        await sendTG('⚠️ 余额不足，请前往挂机页面赚取金币', remainingDays);
-        return;
-      }
-      throw e; // 如果不是余额不足，重新抛出原本的错误截取调试截图
     }
+
+    if (renewResult.status === 'insufficient') {
+      console.log('⚠️ 余额不足，无法续期');
+      await sendTG('⚠️ 余额不足，请前往挂机页面赚取金币', remainingDays);
+      return;
+    }
+
+    throw new Error(`❌ 未识别到续期结果（${renewResult.debugSummary}）`);
 
   } catch (e) {
     await saveDebugArtifacts(page, 'freeze_exception');
