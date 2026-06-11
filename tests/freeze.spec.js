@@ -97,6 +97,28 @@ function normalizeText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
+async function waitForRenewalStatusReady(page, timeout = 15000) {
+  const statusLocator = page.locator('#renewal-status-console');
+
+  await statusLocator.waitFor({ state: 'visible', timeout });
+  await page.waitForFunction(
+    ({ selector }) => {
+      const el = document.querySelector(selector);
+      if (!el) return false;
+
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text) return false;
+      if (/^loading\.\.\.$/i.test(text)) return false;
+      return /(day|hour|cost|not renewable|too early)/i.test(text);
+    },
+    { selector: '#renewal-status-console' },
+    { timeout }
+  );
+
+  const renewalStatusText = await statusLocator.innerText({ timeout: 2000 }).catch(() => null);
+  return normalizeText(renewalStatusText);
+}
+
 async function closeReviewPopupIfPresent(page) {
   try {
     const overlay = page.locator('#review-popup-overlay');
@@ -434,9 +456,7 @@ test('FreezeHost 自动续期', async () => {
     await closeReviewPopupIfPresent(page);
 
     // ======== 注入你的主流程逻辑 ========
-    const renewalStatusText = await page.locator('#renewal-status-console')
-      .innerText()
-      .catch(() => null);
+    const renewalStatusText = await waitForRenewalStatusReady(page).catch(() => null);
 
     if (!renewalStatusText) {
       throw new Error('❌ 未找到 #renewal-status-console，无法确认是否到续期时间');
